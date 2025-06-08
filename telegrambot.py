@@ -2,6 +2,7 @@ import os
 import sqlite3
 import logging
 import re
+import json
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -337,19 +338,41 @@ def extract_tweet_from_html(html):
 
 
 def extract_instagram_from_html(html):
+    """Parse an Instagram post page HTML to get caption, author and image."""
     soup = BeautifulSoup(html, 'html.parser')
     caption = ""
-    meta_desc = soup.find("meta", property="og:description")
-    if meta_desc:
-        m = re.search(r'Instagram: "([^"]+)"', meta_desc.get("content", ""))
-        if m:
-            caption = m.group(1)
-    img_meta = soup.find("meta", property="og:image")
-    img_url = img_meta.get("content") if img_meta else None
+    img_url = None
+    author = ""
+    # Try JSON-LD data first as it contains structured info
+    ld_json = soup.find("script", type="application/ld+json")
+    if ld_json and ld_json.string:
+        try:
+            data = json.loads(ld_json.string)
+            caption = data.get("caption", "")
+            img_url = data.get("image")
+            author_name = data.get("author", {}).get("alternateName")
+            if author_name:
+                author = f"@{author_name.lstrip('@')}"
+        except Exception:
+            pass
+    # Fallback to meta tags if JSON-LD is missing
+    if not caption:
+        meta_desc = soup.find("meta", property="og:description")
+        if meta_desc:
+            m = re.search(r'Instagram: "([^"]+)"', meta_desc.get("content", ""))
+            if m:
+                caption = m.group(1)
+    if not img_url:
+        img_meta = soup.find("meta", property="og:image")
+        if img_meta:
+            img_url = img_meta.get("content")
     mentions = re.findall(r'@([A-Za-z0-9_.]+)', caption)
+    text = caption.strip()
+    if author:
+        text += f"\n\n👤 {author}"
     if mentions:
-        caption += "\n🔗 " + " ".join(f"@{m}" for m in set(mentions))
-    return caption, img_url
+        text += "\n🔗 " + " ".join(f"@{m}" for m in set(mentions))
+    return text, img_url
 
 
 async def scrape_twitter(url, max_posts=POSTS_LIMIT):
