@@ -133,9 +133,14 @@ def delete_channel(channel_id):
 
 
 def assign_admin_to_channel(admin_id, channel_id):
+    """Assign an admin to a channel and ensure they are registered as an admin."""
+    add_admin(admin_id)
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO channels_admins (channel_id, admin_id) VALUES (?, ?)', (channel_id, admin_id))
+    c.execute(
+        'INSERT OR IGNORE INTO channels_admins (channel_id, admin_id) VALUES (?, ?)',
+        (channel_id, admin_id),
+    )
     conn.commit()
     conn.close()
 
