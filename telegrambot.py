@@ -2,9 +2,17 @@ import os
 import sqlite3
 import logging
 import re
+import json
 from datetime import datetime, timedelta
 
 import aiohttp
+from aiohttp import http_exceptions
+from bs4 import BeautifulSoup
+import requests
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -12,7 +20,7 @@ from telegram.ext import (
 )
 import asyncio
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "7840935908:AAHv_up0guGuTYmV69j6AAXUXTXnSubIcbw"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable not set")
 
@@ -61,6 +69,28 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS welcome_channels (
         channel_id INTEGER PRIMARY KEY,
         welcome_text TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT,
+        interval_hours INTEGER DEFAULT 24,
+        last_sent TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS learn_data (
+        question TEXT,
+        answer TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS security_settings (
+        channel_id INTEGER PRIMARY KEY,
+        auto_ban INTEGER DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS banned_users (
+        channel_id INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        reason TEXT,
+        banned_on TEXT,
+        PRIMARY KEY(channel_id, user_id)
     )''')
     conn.commit()
     conn.close()
@@ -129,9 +159,14 @@ def delete_channel(channel_id):
 
 
 def assign_admin_to_channel(admin_id, channel_id):
+    """Assign an admin to a channel and ensure they are registered as an admin."""
+    add_admin(admin_id)
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO channels_admins (channel_id, admin_id) VALUES (?, ?)', (channel_id, admin_id))
+    c.execute(
+        'INSERT OR IGNORE INTO channels_admins (channel_id, admin_id) VALUES (?, ?)',
+        (channel_id, admin_id),
+    )
     conn.commit()
     conn.close()
 
@@ -298,6 +333,151 @@ def get_welcome_text(channel_id):
     return r[0] if r else None
 
 
+def set_auto_ban(channel_id, state: bool):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        'INSERT OR REPLACE INTO security_settings (channel_id, auto_ban) VALUES (?, ?)',
+        (channel_id, int(state)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_auto_ban(channel_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT auto_ban FROM security_settings WHERE channel_id=?', (channel_id,))
+    r = c.fetchone()
+    conn.close()
+    return bool(r[0]) if r else False
+
+
+def ban_user_record(channel_id, user_id, username, reason):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        'INSERT OR REPLACE INTO banned_users (channel_id, user_id, username, reason, banned_on) VALUES (?, ?, ?, ?, ?)',
+        (channel_id, user_id, username, reason, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_banned(channel_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT user_id, username FROM banned_users WHERE channel_id=?', (channel_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def is_user_banned(channel_id, user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM banned_users WHERE channel_id=? AND user_id=?', (channel_id, user_id))
+    r = c.fetchone()
+    conn.close()
+    return r is not None
+
+
+def add_ad(text, interval_hours=24):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('INSERT INTO ads (text, interval_hours, last_sent) VALUES (?, ?, ?)', (text, interval_hours, None))
+    conn.commit()
+    conn.close()
+
+
+def get_ads():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT id, text, interval_hours, last_sent FROM ads')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_ad(ad_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('DELETE FROM ads WHERE id=?', (ad_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_ad(ad_id, text=None, interval_hours=None):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    if text is not None:
+        c.execute('UPDATE ads SET text=? WHERE id=?', (text, ad_id))
+    if interval_hours is not None:
+        c.execute('UPDATE ads SET interval_hours=? WHERE id=?', (interval_hours, ad_id))
+    conn.commit()
+    conn.close()
+
+
+def due_ads():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.now()
+    rows = []
+    for row in c.execute('SELECT id, text, interval_hours, last_sent FROM ads'):
+        ad_id, text, interval_hours, last_sent = row
+        if not last_sent:
+            rows.append(row)
+        else:
+            try:
+                last = datetime.fromisoformat(last_sent)
+            except Exception:
+                last = now
+            if now - last >= timedelta(hours=interval_hours or 24):
+                rows.append(row)
+    conn.close()
+    return rows
+
+
+def mark_ad_sent(ad_id):
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('UPDATE ads SET last_sent=? WHERE id=?', (now, ad_id))
+    conn.commit()
+    conn.close()
+
+
+def add_learn(question, answer):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('INSERT INTO learn_data (question, answer) VALUES (?, ?)', (question, answer))
+    conn.commit()
+    conn.close()
+
+
+def get_learn_data():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT question, answer FROM learn_data')
+    data = c.fetchall()
+    conn.close()
+    return data
+
+
+def get_learn_answer(text):
+    data = get_learn_data()
+    if not data:
+        return None
+    questions = [d[0] for d in data]
+    vectorizer = TfidfVectorizer().fit(questions)
+    vectors = vectorizer.transform(questions + [text])
+    sims = cosine_similarity(vectors[-1], vectors[:-1]).flatten()
+    idx = sims.argmax()
+    if sims[idx] > 0.5:
+        return data[idx][1]
+    return None
+
+
 async def check_channel_access(context, chat_id):
     try:
         chat = await context.bot.get_chat(chat_id)
@@ -308,16 +488,84 @@ async def check_channel_access(context, chat_id):
         return (False, False, str(e))
 
 
-async def fetch(session, url):
+async def fetch_html(url):
+    """Fetch HTML using aiohttp with a requests fallback for large headers."""
     headers = {"User-Agent": "Mozilla/5.0"}
-    async with session.get(url, headers=headers, timeout=10) as resp:
-        return await resp.text()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                return await resp.text()
+    except Exception as e:
+        logger.warning("aiohttp fetch failed for %s: %s", url, e)
+        try:
+            return await asyncio.to_thread(lambda: requests.get(url, headers=headers, timeout=10).text)
+        except Exception as e2:
+            logger.error("requests fetch failed for %s: %s", url, e2)
+            return ""
+
+
+def extract_tweet_from_html(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    tweet_text_tag = soup.find(attrs={"data-testid": "tweetText"})
+    tweet_text = tweet_text_tag.get_text(separator=' ').strip() if tweet_text_tag else ""
+    mentions = []
+    if tweet_text_tag:
+        for a in tweet_text_tag.find_all("a"):
+            href = a.get("href")
+            if href and href.startswith("/"):
+                username = href.split('/')[1]
+                mentions.append(f"@{username}")
+    img_tag = soup.find("img", {"alt": "Image"})
+    img_url = img_tag.get("src") if img_tag else None
+    user_tag = soup.find("a", href=True, attrs={"role": "link"})
+    author = "@" + user_tag.get("href").strip('/') if user_tag else ""
+    txt = f"{tweet_text}\n\n👤 {author}"
+    if mentions:
+        txt += "\n🔗 " + " ".join(set(mentions))
+    return txt, img_url
+
+
+def extract_instagram_from_html(html):
+    """Parse an Instagram post page HTML to get caption, author and image."""
+    soup = BeautifulSoup(html, 'html.parser')
+    caption = ""
+    img_url = None
+    author = ""
+    # Try JSON-LD data first as it contains structured info
+    ld_json = soup.find("script", type="application/ld+json")
+    if ld_json and ld_json.string:
+        try:
+            data = json.loads(ld_json.string)
+            caption = data.get("caption", "")
+            img_url = data.get("image")
+            author_name = data.get("author", {}).get("alternateName")
+            if author_name:
+                author = f"@{author_name.lstrip('@')}"
+        except Exception:
+            pass
+    # Fallback to meta tags if JSON-LD is missing
+    if not caption:
+        meta_desc = soup.find("meta", property="og:description")
+        if meta_desc:
+            m = re.search(r'Instagram: "([^"]+)"', meta_desc.get("content", ""))
+            if m:
+                caption = m.group(1)
+    if not img_url:
+        img_meta = soup.find("meta", property="og:image")
+        if img_meta:
+            img_url = img_meta.get("content")
+    mentions = re.findall(r'@([A-Za-z0-9_.]+)', caption)
+    text = caption.strip()
+    if author:
+        text += f"\n\n👤 {author}"
+    if mentions:
+        text += "\n🔗 " + " ".join(f"@{m}" for m in set(mentions))
+    return text, img_url
 
 
 async def scrape_twitter(url, max_posts=POSTS_LIMIT):
     try:
-        async with aiohttp.ClientSession() as session:
-            html = await fetch(session, url)
+        html = await fetch_html(url)
         found = re.findall(r'/status/(\d+)', html)
         unique = []
         [unique.append(x) for x in found if x not in unique]
@@ -329,8 +577,7 @@ async def scrape_twitter(url, max_posts=POSTS_LIMIT):
 
 async def scrape_instagram(url, max_posts=POSTS_LIMIT):
     try:
-        async with aiohttp.ClientSession() as session:
-            html = await fetch(session, url)
+        html = await fetch_html(url)
         found = re.findall(r'"shortcode":"([^"]+)"', html)
         unique = []
         [unique.append(x) for x in found if x not in unique]
@@ -349,8 +596,55 @@ def get_post_url(platform, user_url, post_id):
     return ""
 
 
+async def send_post_details(context, chat_id, platform, post_url):
+    try:
+        html = await fetch_html(post_url)
+        if platform == "Twitter":
+            text, img = extract_tweet_from_html(html)
+        elif platform == "Instagram":
+            text, img = extract_instagram_from_html(html)
+        else:
+            text, img = "", None
+        message = text.strip() if text else ""
+        if message:
+            message += f"\n\n🔗 {post_url}"
+            await context.bot.send_message(chat_id=chat_id, text=message)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=post_url)
+        if img:
+            await context.bot.send_photo(chat_id=chat_id, photo=img)
+    except Exception as e:
+        logger.error(f"send_post_details failed for {post_url}: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=post_url)
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+try:
+    AI_TOKENIZER = AutoTokenizer.from_pretrained("microsoft/DialoGPT-small")
+    AI_MODEL = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-small")
+    AI_HISTORY = {}
+except Exception as e:
+    logger.error("AI init failed: %s", e)
+    AI_TOKENIZER = None
+    AI_MODEL = None
+    AI_HISTORY = {}
+
+
+def ai_reply(user_id: int, text: str) -> str:
+    if not AI_MODEL or not AI_TOKENIZER:
+        return "Module IA indisponible."
+    new_ids = AI_TOKENIZER.encode(text + AI_TOKENIZER.eos_token, return_tensors="pt")
+    history = AI_HISTORY.get(user_id)
+    if history is not None:
+        bot_input_ids = torch.cat([history, new_ids], dim=-1)
+    else:
+        bot_input_ids = new_ids
+    output_ids = AI_MODEL.generate(bot_input_ids, max_length=200, pad_token_id=AI_TOKENIZER.eos_token_id)
+    AI_HISTORY[user_id] = output_ids
+    reply = AI_TOKENIZER.decode(output_ids[:, bot_input_ids.shape[-1]:][0], skip_special_tokens=True)
+    return reply.strip()
 
 
 def is_authorized(user_id, channel_id=None):
@@ -369,6 +663,7 @@ async def show_main_menu(target):
         [InlineKeyboardButton("🕒 Ajouter anciens posts", callback_data="add_oldposts")],
         [InlineKeyboardButton("🛡 Gérer les admins", callback_data="menu_admins")],
         [InlineKeyboardButton("📎 Assignation admins/canaux", callback_data="assign_menu")],
+        [InlineKeyboardButton("📢 Gérer pubs", callback_data="menu_ads")],
         [InlineKeyboardButton("🔍 Tester envoi", callback_data="test_posting")]
     ]
     markup = InlineKeyboardMarkup(keyboard)
@@ -452,6 +747,61 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Paramètre invalide: on ou off")
 
 
+async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔️ Accès refusé.")
+        return
+    if not context.args or "|" not in " ".join(context.args):
+        await update.message.reply_text("Usage: /learn question | réponse")
+        return
+    raw = " ".join(context.args)
+    question, answer = map(str.strip, raw.split("|", 1))
+    add_learn(question, answer)
+    await update.message.reply_text("✅ Appris !")
+
+
+async def cmd_setsecurity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /setsecurity <channel_id> on|off")
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Channel id invalide")
+        return
+    if not is_authorized(user_id, channel_id):
+        await update.message.reply_text("⛔️ Accès refusé.")
+        return
+    state = context.args[1].lower() == "on"
+    set_auto_ban(channel_id, state)
+    await update.message.reply_text(
+        f"Sécurité {'activée' if state else 'désactivée'} pour {channel_id}"
+    )
+
+
+async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Usage: /banned <channel_id>")
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Channel id invalide")
+        return
+    if not is_authorized(user_id, channel_id):
+        await update.message.reply_text("⛔️ Accès refusé.")
+        return
+    banned = get_banned(channel_id)
+    if banned:
+        txt = "\n".join(f"{uid} {uname or ''}" for uid, uname in banned)
+    else:
+        txt = "Aucun bannissement"
+    await update.message.reply_text(txt)
+
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -515,6 +865,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(query)
     elif data == "test_posting":
         await test_posting(query, context)
+    elif data == "menu_ads":
+        await menu_ads(query)
+    elif data.startswith("add_ad"):
+        context.user_data["add_ad"] = True
+        await query.edit_message_text("Envoie le texte de la pub suivi éventuellement de l'intervalle en heures (ex: 24)")
+    elif data.startswith("delete_ad|"):
+        ad_id = int(data.split("|")[1])
+        delete_ad(ad_id)
+        await menu_ads(query)
     elif data == "menu_admins":
         await menu_admins(query)
     elif data.startswith("add_admin"):
@@ -598,6 +957,20 @@ async def menu_admins(query):
     kb.append([InlineKeyboardButton("➕ Ajouter un admin", callback_data="add_admin")])
     kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="main_menu")])
     await query.edit_message_text("🛡 Gestion des admins :", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def menu_ads(query):
+    ads = get_ads()
+    kb = []
+    for ad in ads:
+        display = ad[1][:20] + ("…" if len(ad[1]) > 20 else "")
+        kb.append([
+            InlineKeyboardButton(display, callback_data="noop"),
+            InlineKeyboardButton("🗑️", callback_data=f"delete_ad|{ad[0]}")
+        ])
+    kb.append([InlineKeyboardButton("➕ Ajouter pub", callback_data="add_ad")])
+    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="main_menu")])
+    await query.edit_message_text("📢 Gestion des pubs :", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def assign_menu(query):
@@ -699,6 +1072,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update)
         await post_all_now(channel_id, context, POSTS_LIMIT)
         return
+    if context.user_data.get("add_ad"):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2 and parts[0].isdigit():
+            interval = int(parts[0])
+            ad_text = parts[1]
+        else:
+            interval = 24
+            ad_text = text
+        add_ad(ad_text, interval)
+        await update.message.reply_text("✅ Pub enregistrée.")
+        await show_main_menu(update)
+        return
+    learn_ans = get_learn_answer(text)
+    if learn_ans:
+        await update.message.reply_text(learn_ans)
+    elif AI_MODEL:
+        reply = await asyncio.to_thread(ai_reply, user_id, text)
+        await update.message.reply_text(reply)
     await show_main_menu(update)
 
 
@@ -728,10 +1119,7 @@ async def post_all_now(channel_id, context, limit=POSTS_LIMIT):
         for post in posts:
             if not post_exists(link_id, post):
                 post_url = get_post_url(plat, url, post)
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=post_url)
-                except Exception as e:
-                    logger.error(f"Erreur d’envoi immédiat {chat_id} : {e}")
+                await send_post_details(context, chat_id, plat, post_url)
                 mark_posted(link_id, post)
 
 
@@ -757,7 +1145,7 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
             for post in posts:
                 if not post_exists(link_id, post):
                     post_url = get_post_url(plat, url, post)
-                    await context.bot.send_message(chat_id=chat_id, text=post_url)
+                    await send_post_details(context, chat_id, plat, post_url)
                     mark_posted(link_id, post)
                     has_new = True
             if not has_new:
@@ -769,7 +1157,7 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
                 if old:
                     post_db_id, post_id = old
                     post_url = get_post_url(plat, url, post_id)
-                    await context.bot.send_message(chat_id=chat_id, text=post_url)
+                    await send_post_details(context, chat_id, plat, post_url)
                     set_posted(post_db_id)
         except Exception as e:
             logger.error(f"Erreur sur {plat} {url}: {e}")
@@ -800,6 +1188,56 @@ async def scan_members_and_notify(context):
             logger.error(f"Erreur stat membres {chat_id} : {e}")
 
 
+async def send_due_ads(context):
+    ads = due_ads()
+    if not ads:
+        return
+    channels = get_channels()
+    for ad_id, text, interval_hours, _ in ads:
+        for chan in channels:
+            chat_id = chan[2]
+            ok, can_post, _ = await check_channel_access(context, chat_id)
+            if ok and can_post:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=text)
+                except Exception as e:
+                    logger.error(f"send_due_ads failed on {chat_id}: {e}")
+        mark_ad_sent(ad_id)
+
+
+async def new_member_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    channel_id = update.effective_chat.id
+    if not get_auto_ban(channel_id):
+        return
+    for member in update.message.new_chat_members:
+        uname = member.username or ""
+        if re.search(r"sex|porn|t\.me", uname, re.I):
+            try:
+                await update.effective_chat.ban_member(member.id)
+                ban_user_record(channel_id, member.id, uname, "suspicious username")
+            except Exception as e:
+                logger.error("Auto-ban failed for %s on %s: %s", member.id, channel_id, e)
+
+
+async def security_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    channel_id = update.effective_chat.id
+    if not get_auto_ban(channel_id):
+        return
+    text = update.message.text or ""
+    if re.search(r"http(s)?://t\.me/", text, re.I):
+        try:
+            await update.message.delete()
+            user = update.effective_user
+            await update.effective_chat.ban_member(user.id)
+            ban_user_record(channel_id, user.id, user.username or "", "spam message")
+        except Exception as e:
+            logger.error("Auto-ban message failed for %s on %s: %s", user.id, channel_id, e)
+
+
 def seconds_until_next_run():
     now = datetime.now()
     hours = [8, 12, 16, 20]
@@ -822,6 +1260,7 @@ async def scheduler_loop(app):
         try:
             await scan_and_post(app)
             await scan_members_and_notify(app)
+            await send_due_ads(app)
         except Exception as e:
             logger.error(f"Erreur sur scan_and_post ou scan_members_and_notify: {e}")
 
@@ -854,7 +1293,13 @@ async def main():
     app.add_handler(CommandHandler("members", cmd_members))
     app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
+    app.add_handler(CommandHandler("learn", cmd_learn))
+    app.add_handler(CommandHandler("setsecurity", cmd_setsecurity))
+    app.add_handler(CommandHandler("banned", cmd_banned))
     app.add_handler(CallbackQueryHandler(button))
+    # Security filter should run before the general text handler
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_security))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, security_filter))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL, always_main_menu))
     asyncio.create_task(scheduler_loop(app))

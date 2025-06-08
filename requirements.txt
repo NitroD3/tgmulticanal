@@ -1,0 +1,8 @@
+python-telegram-bot==20.7
+aiohttp
+requests
+beautifulsoup4
+transformers
+torch
+scikit-learn
+nest_asyncio
