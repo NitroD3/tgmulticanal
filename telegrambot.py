@@ -80,6 +80,18 @@ def init_db():
         question TEXT,
         answer TEXT
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS security_settings (
+        channel_id INTEGER PRIMARY KEY,
+        auto_ban INTEGER DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS banned_users (
+        channel_id INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        reason TEXT,
+        banned_on TEXT,
+        PRIMARY KEY(channel_id, user_id)
+    )''')
     conn.commit()
     conn.close()
 
@@ -319,6 +331,55 @@ def get_welcome_text(channel_id):
     r = c.fetchone()
     conn.close()
     return r[0] if r else None
+
+
+def set_auto_ban(channel_id, state: bool):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        'INSERT OR REPLACE INTO security_settings (channel_id, auto_ban) VALUES (?, ?)',
+        (channel_id, int(state)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_auto_ban(channel_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT auto_ban FROM security_settings WHERE channel_id=?', (channel_id,))
+    r = c.fetchone()
+    conn.close()
+    return bool(r[0]) if r else False
+
+
+def ban_user_record(channel_id, user_id, username, reason):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        'INSERT OR REPLACE INTO banned_users (channel_id, user_id, username, reason, banned_on) VALUES (?, ?, ?, ?, ?)',
+        (channel_id, user_id, username, reason, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_banned(channel_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT user_id, username FROM banned_users WHERE channel_id=?', (channel_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def is_user_banned(channel_id, user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM banned_users WHERE channel_id=? AND user_id=?', (channel_id, user_id))
+    r = c.fetchone()
+    conn.close()
+    return r is not None
 
 
 def add_ad(text, interval_hours=24):
@@ -698,6 +759,47 @@ async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question, answer = map(str.strip, raw.split("|", 1))
     add_learn(question, answer)
     await update.message.reply_text("✅ Appris !")
+
+
+async def cmd_setsecurity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /setsecurity <channel_id> on|off")
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Channel id invalide")
+        return
+    if not is_authorized(user_id, channel_id):
+        await update.message.reply_text("⛔️ Accès refusé.")
+        return
+    state = context.args[1].lower() == "on"
+    set_auto_ban(channel_id, state)
+    await update.message.reply_text(
+        f"Sécurité {'activée' if state else 'désactivée'} pour {channel_id}"
+    )
+
+
+async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Usage: /banned <channel_id>")
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Channel id invalide")
+        return
+    if not is_authorized(user_id, channel_id):
+        await update.message.reply_text("⛔️ Accès refusé.")
+        return
+    banned = get_banned(channel_id)
+    if banned:
+        txt = "\n".join(f"{uid} {uname or ''}" for uid, uname in banned)
+    else:
+        txt = "Aucun bannissement"
+    await update.message.reply_text(txt)
 
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1103,6 +1205,39 @@ async def send_due_ads(context):
         mark_ad_sent(ad_id)
 
 
+async def new_member_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    channel_id = update.effective_chat.id
+    if not get_auto_ban(channel_id):
+        return
+    for member in update.message.new_chat_members:
+        uname = member.username or ""
+        if re.search(r"sex|porn|t\.me", uname, re.I):
+            try:
+                await update.effective_chat.ban_member(member.id)
+                ban_user_record(channel_id, member.id, uname, "suspicious username")
+            except Exception as e:
+                logger.error("Auto-ban failed for %s on %s: %s", member.id, channel_id, e)
+
+
+async def security_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    channel_id = update.effective_chat.id
+    if not get_auto_ban(channel_id):
+        return
+    text = update.message.text or ""
+    if re.search(r"http(s)?://t\.me/", text, re.I):
+        try:
+            await update.message.delete()
+            user = update.effective_user
+            await update.effective_chat.ban_member(user.id)
+            ban_user_record(channel_id, user.id, user.username or "", "spam message")
+        except Exception as e:
+            logger.error("Auto-ban message failed for %s on %s: %s", user.id, channel_id, e)
+
+
 def seconds_until_next_run():
     now = datetime.now()
     hours = [8, 12, 16, 20]
@@ -1159,8 +1294,12 @@ async def main():
     app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
     app.add_handler(CommandHandler("learn", cmd_learn))
+    app.add_handler(CommandHandler("setsecurity", cmd_setsecurity))
+    app.add_handler(CommandHandler("banned", cmd_banned))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_security))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, security_filter))
     app.add_handler(MessageHandler(filters.ALL, always_main_menu))
     asyncio.create_task(scheduler_loop(app))
     await app.run_polling()
