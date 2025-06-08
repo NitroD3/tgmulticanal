@@ -9,6 +9,10 @@ import aiohttp
 from aiohttp import http_exceptions
 from bs4 import BeautifulSoup
 import requests
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -65,6 +69,16 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS welcome_channels (
         channel_id INTEGER PRIMARY KEY,
         welcome_text TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT,
+        interval_hours INTEGER DEFAULT 24,
+        last_sent TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS learn_data (
+        question TEXT,
+        answer TEXT
     )''')
     conn.commit()
     conn.close()
@@ -307,6 +321,102 @@ def get_welcome_text(channel_id):
     return r[0] if r else None
 
 
+def add_ad(text, interval_hours=24):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('INSERT INTO ads (text, interval_hours, last_sent) VALUES (?, ?, ?)', (text, interval_hours, None))
+    conn.commit()
+    conn.close()
+
+
+def get_ads():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT id, text, interval_hours, last_sent FROM ads')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_ad(ad_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('DELETE FROM ads WHERE id=?', (ad_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_ad(ad_id, text=None, interval_hours=None):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    if text is not None:
+        c.execute('UPDATE ads SET text=? WHERE id=?', (text, ad_id))
+    if interval_hours is not None:
+        c.execute('UPDATE ads SET interval_hours=? WHERE id=?', (interval_hours, ad_id))
+    conn.commit()
+    conn.close()
+
+
+def due_ads():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.now()
+    rows = []
+    for row in c.execute('SELECT id, text, interval_hours, last_sent FROM ads'):
+        ad_id, text, interval_hours, last_sent = row
+        if not last_sent:
+            rows.append(row)
+        else:
+            try:
+                last = datetime.fromisoformat(last_sent)
+            except Exception:
+                last = now
+            if now - last >= timedelta(hours=interval_hours or 24):
+                rows.append(row)
+    conn.close()
+    return rows
+
+
+def mark_ad_sent(ad_id):
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('UPDATE ads SET last_sent=? WHERE id=?', (now, ad_id))
+    conn.commit()
+    conn.close()
+
+
+def add_learn(question, answer):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('INSERT INTO learn_data (question, answer) VALUES (?, ?)', (question, answer))
+    conn.commit()
+    conn.close()
+
+
+def get_learn_data():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT question, answer FROM learn_data')
+    data = c.fetchall()
+    conn.close()
+    return data
+
+
+def get_learn_answer(text):
+    data = get_learn_data()
+    if not data:
+        return None
+    questions = [d[0] for d in data]
+    vectorizer = TfidfVectorizer().fit(questions)
+    vectors = vectorizer.transform(questions + [text])
+    sims = cosine_similarity(vectors[-1], vectors[:-1]).flatten()
+    idx = sims.argmax()
+    if sims[idx] > 0.5:
+        return data[idx][1]
+    return None
+
+
 async def check_channel_access(context, chat_id):
     try:
         chat = await context.bot.get_chat(chat_id)
@@ -450,6 +560,31 @@ async def send_post_details(context, chat_id, platform, post_url):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+try:
+    AI_TOKENIZER = AutoTokenizer.from_pretrained("microsoft/DialoGPT-small")
+    AI_MODEL = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-small")
+    AI_HISTORY = {}
+except Exception as e:
+    logger.error("AI init failed: %s", e)
+    AI_TOKENIZER = None
+    AI_MODEL = None
+    AI_HISTORY = {}
+
+
+def ai_reply(user_id: int, text: str) -> str:
+    if not AI_MODEL or not AI_TOKENIZER:
+        return "Module IA indisponible."
+    new_ids = AI_TOKENIZER.encode(text + AI_TOKENIZER.eos_token, return_tensors="pt")
+    history = AI_HISTORY.get(user_id)
+    if history is not None:
+        bot_input_ids = torch.cat([history, new_ids], dim=-1)
+    else:
+        bot_input_ids = new_ids
+    output_ids = AI_MODEL.generate(bot_input_ids, max_length=200, pad_token_id=AI_TOKENIZER.eos_token_id)
+    AI_HISTORY[user_id] = output_ids
+    reply = AI_TOKENIZER.decode(output_ids[:, bot_input_ids.shape[-1]:][0], skip_special_tokens=True)
+    return reply.strip()
+
 
 def is_authorized(user_id, channel_id=None):
     if channel_id:
@@ -467,6 +602,7 @@ async def show_main_menu(target):
         [InlineKeyboardButton("🕒 Ajouter anciens posts", callback_data="add_oldposts")],
         [InlineKeyboardButton("🛡 Gérer les admins", callback_data="menu_admins")],
         [InlineKeyboardButton("📎 Assignation admins/canaux", callback_data="assign_menu")],
+        [InlineKeyboardButton("📢 Gérer pubs", callback_data="menu_ads")],
         [InlineKeyboardButton("🔍 Tester envoi", callback_data="test_posting")]
     ]
     markup = InlineKeyboardMarkup(keyboard)
@@ -550,6 +686,20 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Paramètre invalide: on ou off")
 
 
+async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔️ Accès refusé.")
+        return
+    if not context.args or "|" not in " ".join(context.args):
+        await update.message.reply_text("Usage: /learn question | réponse")
+        return
+    raw = " ".join(context.args)
+    question, answer = map(str.strip, raw.split("|", 1))
+    add_learn(question, answer)
+    await update.message.reply_text("✅ Appris !")
+
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -613,6 +763,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(query)
     elif data == "test_posting":
         await test_posting(query, context)
+    elif data == "menu_ads":
+        await menu_ads(query)
+    elif data.startswith("add_ad"):
+        context.user_data["add_ad"] = True
+        await query.edit_message_text("Envoie le texte de la pub suivi éventuellement de l'intervalle en heures (ex: 24)")
+    elif data.startswith("delete_ad|"):
+        ad_id = int(data.split("|")[1])
+        delete_ad(ad_id)
+        await menu_ads(query)
     elif data == "menu_admins":
         await menu_admins(query)
     elif data.startswith("add_admin"):
@@ -696,6 +855,20 @@ async def menu_admins(query):
     kb.append([InlineKeyboardButton("➕ Ajouter un admin", callback_data="add_admin")])
     kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="main_menu")])
     await query.edit_message_text("🛡 Gestion des admins :", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def menu_ads(query):
+    ads = get_ads()
+    kb = []
+    for ad in ads:
+        display = ad[1][:20] + ("…" if len(ad[1]) > 20 else "")
+        kb.append([
+            InlineKeyboardButton(display, callback_data="noop"),
+            InlineKeyboardButton("🗑️", callback_data=f"delete_ad|{ad[0]}")
+        ])
+    kb.append([InlineKeyboardButton("➕ Ajouter pub", callback_data="add_ad")])
+    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="main_menu")])
+    await query.edit_message_text("📢 Gestion des pubs :", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def assign_menu(query):
@@ -797,6 +970,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update)
         await post_all_now(channel_id, context, POSTS_LIMIT)
         return
+    if context.user_data.get("add_ad"):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2 and parts[0].isdigit():
+            interval = int(parts[0])
+            ad_text = parts[1]
+        else:
+            interval = 24
+            ad_text = text
+        add_ad(ad_text, interval)
+        await update.message.reply_text("✅ Pub enregistrée.")
+        await show_main_menu(update)
+        return
+    learn_ans = get_learn_answer(text)
+    if learn_ans:
+        await update.message.reply_text(learn_ans)
+    elif AI_MODEL:
+        reply = await asyncio.to_thread(ai_reply, user_id, text)
+        await update.message.reply_text(reply)
     await show_main_menu(update)
 
 
@@ -895,6 +1086,23 @@ async def scan_members_and_notify(context):
             logger.error(f"Erreur stat membres {chat_id} : {e}")
 
 
+async def send_due_ads(context):
+    ads = due_ads()
+    if not ads:
+        return
+    channels = get_channels()
+    for ad_id, text, interval_hours, _ in ads:
+        for chan in channels:
+            chat_id = chan[2]
+            ok, can_post, _ = await check_channel_access(context, chat_id)
+            if ok and can_post:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=text)
+                except Exception as e:
+                    logger.error(f"send_due_ads failed on {chat_id}: {e}")
+        mark_ad_sent(ad_id)
+
+
 def seconds_until_next_run():
     now = datetime.now()
     hours = [8, 12, 16, 20]
@@ -917,6 +1125,7 @@ async def scheduler_loop(app):
         try:
             await scan_and_post(app)
             await scan_members_and_notify(app)
+            await send_due_ads(app)
         except Exception as e:
             logger.error(f"Erreur sur scan_and_post ou scan_members_and_notify: {e}")
 
@@ -949,6 +1158,7 @@ async def main():
     app.add_handler(CommandHandler("members", cmd_members))
     app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
+    app.add_handler(CommandHandler("learn", cmd_learn))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL, always_main_menu))
