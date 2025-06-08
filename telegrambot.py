@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timedelta
 
 import aiohttp
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -314,6 +315,43 @@ async def fetch(session, url):
         return await resp.text()
 
 
+def extract_tweet_from_html(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    tweet_text_tag = soup.find(attrs={"data-testid": "tweetText"})
+    tweet_text = tweet_text_tag.get_text(separator=' ').strip() if tweet_text_tag else ""
+    mentions = []
+    if tweet_text_tag:
+        for a in tweet_text_tag.find_all("a"):
+            href = a.get("href")
+            if href and href.startswith("/"):
+                username = href.split('/')[1]
+                mentions.append(f"@{username}")
+    img_tag = soup.find("img", {"alt": "Image"})
+    img_url = img_tag.get("src") if img_tag else None
+    user_tag = soup.find("a", href=True, attrs={"role": "link"})
+    author = "@" + user_tag.get("href").strip('/') if user_tag else ""
+    txt = f"{tweet_text}\n\n👤 {author}"
+    if mentions:
+        txt += "\n🔗 " + " ".join(set(mentions))
+    return txt, img_url
+
+
+def extract_instagram_from_html(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    caption = ""
+    meta_desc = soup.find("meta", property="og:description")
+    if meta_desc:
+        m = re.search(r'Instagram: "([^"]+)"', meta_desc.get("content", ""))
+        if m:
+            caption = m.group(1)
+    img_meta = soup.find("meta", property="og:image")
+    img_url = img_meta.get("content") if img_meta else None
+    mentions = re.findall(r'@([A-Za-z0-9_.]+)', caption)
+    if mentions:
+        caption += "\n🔗 " + " ".join(f"@{m}" for m in set(mentions))
+    return caption, img_url
+
+
 async def scrape_twitter(url, max_posts=POSTS_LIMIT):
     try:
         async with aiohttp.ClientSession() as session:
@@ -347,6 +385,29 @@ def get_post_url(platform, user_url, post_id):
     if platform == "Instagram":
         return f"https://www.instagram.com/p/{post_id}/"
     return ""
+
+
+async def send_post_details(context, chat_id, platform, post_url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            html = await fetch(session, post_url)
+        if platform == "Twitter":
+            text, img = extract_tweet_from_html(html)
+        elif platform == "Instagram":
+            text, img = extract_instagram_from_html(html)
+        else:
+            text, img = "", None
+        message = text.strip() if text else ""
+        if message:
+            message += f"\n\n🔗 {post_url}"
+            await context.bot.send_message(chat_id=chat_id, text=message)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=post_url)
+        if img:
+            await context.bot.send_photo(chat_id=chat_id, photo=img)
+    except Exception as e:
+        logger.error(f"send_post_details failed for {post_url}: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=post_url)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -728,10 +789,7 @@ async def post_all_now(channel_id, context, limit=POSTS_LIMIT):
         for post in posts:
             if not post_exists(link_id, post):
                 post_url = get_post_url(plat, url, post)
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=post_url)
-                except Exception as e:
-                    logger.error(f"Erreur d’envoi immédiat {chat_id} : {e}")
+                await send_post_details(context, chat_id, plat, post_url)
                 mark_posted(link_id, post)
 
 
@@ -757,7 +815,7 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
             for post in posts:
                 if not post_exists(link_id, post):
                     post_url = get_post_url(plat, url, post)
-                    await context.bot.send_message(chat_id=chat_id, text=post_url)
+                    await send_post_details(context, chat_id, plat, post_url)
                     mark_posted(link_id, post)
                     has_new = True
             if not has_new:
@@ -769,7 +827,7 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
                 if old:
                     post_db_id, post_id = old
                     post_url = get_post_url(plat, url, post_id)
-                    await context.bot.send_message(chat_id=chat_id, text=post_url)
+                    await send_post_details(context, chat_id, plat, post_url)
                     set_posted(post_db_id)
         except Exception as e:
             logger.error(f"Erreur sur {plat} {url}: {e}")
