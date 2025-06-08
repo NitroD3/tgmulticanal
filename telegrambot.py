@@ -6,7 +6,9 @@ import json
 from datetime import datetime, timedelta
 
 import aiohttp
+from aiohttp import http_exceptions
 from bs4 import BeautifulSoup
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -310,10 +312,20 @@ async def check_channel_access(context, chat_id):
         return (False, False, str(e))
 
 
-async def fetch(session, url):
+async def fetch_html(url):
+    """Fetch HTML using aiohttp with a requests fallback for large headers."""
     headers = {"User-Agent": "Mozilla/5.0"}
-    async with session.get(url, headers=headers, timeout=10) as resp:
-        return await resp.text()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                return await resp.text()
+    except Exception as e:
+        logger.warning("aiohttp fetch failed for %s: %s", url, e)
+        try:
+            return await asyncio.to_thread(lambda: requests.get(url, headers=headers, timeout=10).text)
+        except Exception as e2:
+            logger.error("requests fetch failed for %s: %s", url, e2)
+            return ""
 
 
 def extract_tweet_from_html(html):
@@ -377,8 +389,7 @@ def extract_instagram_from_html(html):
 
 async def scrape_twitter(url, max_posts=POSTS_LIMIT):
     try:
-        async with aiohttp.ClientSession() as session:
-            html = await fetch(session, url)
+        html = await fetch_html(url)
         found = re.findall(r'/status/(\d+)', html)
         unique = []
         [unique.append(x) for x in found if x not in unique]
@@ -390,8 +401,7 @@ async def scrape_twitter(url, max_posts=POSTS_LIMIT):
 
 async def scrape_instagram(url, max_posts=POSTS_LIMIT):
     try:
-        async with aiohttp.ClientSession() as session:
-            html = await fetch(session, url)
+        html = await fetch_html(url)
         found = re.findall(r'"shortcode":"([^"]+)"', html)
         unique = []
         [unique.append(x) for x in found if x not in unique]
@@ -412,8 +422,7 @@ def get_post_url(platform, user_url, post_id):
 
 async def send_post_details(context, chat_id, platform, post_url):
     try:
-        async with aiohttp.ClientSession() as session:
-            html = await fetch(session, post_url)
+        html = await fetch_html(post_url)
         if platform == "Twitter":
             text, img = extract_tweet_from_html(html)
         elif platform == "Instagram":
